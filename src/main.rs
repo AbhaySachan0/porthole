@@ -2,6 +2,47 @@ use std::env;
 use std::net::UdpSocket;
 use std::process;
 
+struct Header {
+    packet_type: u8,  // 1 byte
+    seq_num: u32,     // 4 bytes
+    payload_len: u16, // 2 bytes
+}
+
+impl Header {
+    fn pack(&self) -> [u8; 7] {
+        let mut buffer = [0u8; 7];
+
+        buffer[0] = self.packet_type;
+
+        // packing the sequence number
+        buffer[1] = (self.seq_num >> 24) as u8;
+        buffer[2] = (self.seq_num >> 16) as u8;
+        buffer[3] = (self.seq_num >> 8) as u8;
+        buffer[4] = self.seq_num as u8;
+
+        // payload length
+        buffer[5] = (self.payload_len >> 8) as u8;
+        buffer[6] = self.payload_len as u8;
+
+        buffer
+    }
+    
+    fn unpack(buffer: &[u8]) -> Self {
+        let packet_type = buffer[0];
+        let seq_num = ((buffer[1] as u32) << 24) | ((buffer[2] as u32) << 16) | ((buffer[3] as u32) << 8) | (buffer[4] as u32);
+
+        let payload_len = ((buffer[5] as u16) << 8) | (buffer[6] as u16);
+
+        Header {
+            packet_type,
+            seq_num,
+            payload_len,
+        }
+    }
+}
+
+
+
 fn main() {
     let args: Vec<String> = env::args().collect();    
 
@@ -42,9 +83,31 @@ fn run_reciever() {
 
     let (size, source) = socket.recv_from(&mut buffer).expect("failed to recieve");
 
-    let message = String::from_utf8_lossy(&buffer[..size]);
+    if size < 7 {
+        eprintln!("Packet too small from {}", source);
+        return;
+    }
 
-    println!("Recieved '{}' from {}",message,source);
+    let header = Header::unpack(&buffer[0..7]);
+
+    println!("--- INCOMING PACKET METADATA ---");
+    println!("Type: {}", header.packet_type);
+    println!("Chunk Number: {}", header.seq_num);
+    println!("Message Size: {}", header.payload_len);
+
+    let payload_start = 7;
+    let payload_end = 7 + header.payload_len as usize;
+
+    if size < payload_end {
+        eprintln!("Corrupted packet: expected {} bytes but got less", header.payload_len);
+        return;
+
+    }
+
+    let payload_bytes = &buffer[payload_start..payload_end];
+    let message = String::from_utf8_lossy(payload_bytes);
+    println!("Message: {}",message);
+
 }
 
 
@@ -57,6 +120,19 @@ fn run_sender(target: &str) {
     std::io::stdin().read_line(&mut message).expect("Failed to input the message");
 
     let message = message.trim_end();
-    socket.send_to(message.as_bytes(), target).expect("Failed to send");
-    println!("message sent");
+    let payload = message.as_bytes();
+
+    let header = Header {
+        packet_type: 0,
+        seq_num: 1,
+        payload_len: payload.len() as u16,
+    };
+
+    let header_bytes = header.pack();
+
+    let mut packet = Vec::new();
+    packet.extend_from_slice(&header_bytes);
+    packet.extend_from_slice(payload);
+    socket.send_to(&packet, target).expect("Failed to send");
+    println!("Sent packet with sequence number {}.", header.seq_num);
 }
