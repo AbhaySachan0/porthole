@@ -1,6 +1,8 @@
 use std::env;
 use std::net::UdpSocket;
 use std::process;
+use std::fs::File;
+use std::io::{ Read, Write};
 
 struct Header {
     packet_type: u8,  // 1 byte
@@ -79,60 +81,72 @@ fn run_reciever() {
     let socket = UdpSocket::bind("0.0.0.0:8080").expect("Failed to bind");
     println!("Listning on port 8080");
 
-    let mut buffer = [0; 1024];
+    let mut file = File::create("recieved_file.txt").expect("Failed to create file");
 
-    let (size, source) = socket.recv_from(&mut buffer).expect("failed to recieve");
+    let mut buffer = [0; 1500];
 
-    if size < 7 {
-        eprintln!("Packet too small from {}", source);
-        return;
+
+    loop {
+        let (size, source) = socket.recv_from(&mut buffer).expect("failed to recieve");
+        if size <7 {
+            continue;
+        }
+        let header = Header::unpack(&buffer[0..7]);
+
+        if header.packet_type==2 {
+            println!("Recieved EOF packet from {}. File transfer complete", source);
+            break;
+        }
+
+        let payload_start = 7;
+        let payload_end = 7 + header.payload_len as usize;
+        
+        if size<payload_end { continue; }
+        let payload_bytes = &buffer[payload_start..payload_end];
+        file.write_all(payload_bytes).expect("Failed to write to file");
+        
+        println!("Saved chunk {} ({} bytes", header.seq_num, header.payload_len);
+    
     }
-
-    let header = Header::unpack(&buffer[0..7]);
-
-    println!("--- INCOMING PACKET METADATA ---");
-    println!("Type: {}", header.packet_type);
-    println!("Chunk Number: {}", header.seq_num);
-    println!("Message Size: {}", header.payload_len);
-
-    let payload_start = 7;
-    let payload_end = 7 + header.payload_len as usize;
-
-    if size < payload_end {
-        eprintln!("Corrupted packet: expected {} bytes but got less", header.payload_len);
-        return;
-
-    }
-
-    let payload_bytes = &buffer[payload_start..payload_end];
-    let message = String::from_utf8_lossy(payload_bytes);
-    println!("Message: {}",message);
-
 }
 
 
 fn run_sender(target: &str) {
     let socket = UdpSocket::bind("0.0.0.0:0").expect("Failed to bind");
 
-    print!("What's the message: ");
-    std::io::Write::flush(&mut std::io::stdout()).unwrap();
-    let mut message = String::new();
-    std::io::stdin().read_line(&mut message).expect("Failed to input the message");
 
-    let message = message.trim_end();
-    let payload = message.as_bytes();
+    let mut file = File::open("test.txt").expect("Failed to open file..");
+    let mut seq_num = 1;
+    let mut chunk_buffer = [0u8; 1000];
 
-    let header = Header {
-        packet_type: 0,
-        seq_num: 1,
-        payload_len: payload.len() as u16,
-    };
+    println!("Starting file transfer.....");
 
-    let header_bytes = header.pack();
+    loop {
+        let bytes_read = file.read(&mut chunk_buffer).expect("Failed to read file");
 
-    let mut packet = Vec::new();
-    packet.extend_from_slice(&header_bytes);
-    packet.extend_from_slice(payload);
-    socket.send_to(&packet, target).expect("Failed to send");
-    println!("Sent packet with sequence number {}.", header.seq_num);
+        if bytes_read == 0{
+            println!("File read completely. Sending EOF packet...");
+            let eof_header = Header {
+                packet_type: 2,
+                seq_num,
+                payload_len: 0,
+            };
+            socket.send_to(&eof_header.pack(), target).expect("failed to send EOF");
+            break;
+        }
+        let header = Header {
+            packet_type:0,
+            seq_num,
+            payload_len: bytes_read as u16,
+        };
+        let mut packet = Vec::new();
+        packet.extend_from_slice(&header.pack());
+        packet.extend_from_slice(&chunk_buffer[..bytes_read]); // only the bytes we read
+
+        socket.send_to(&packet, target).expect("Failed to send chunk..");
+        println!("Sent chunk {} ({} bytes", seq_num, bytes_read);
+        seq_num += 1;
+    }
+
+    println!("Trander conplete");
 }
