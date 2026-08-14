@@ -3,6 +3,7 @@ use std::net::UdpSocket;
 use std::process;
 use std::fs::File;
 use std::io::{ Read, Write};
+use std::time::Duration;
 
 struct Header {
     packet_type: u8,  // 1 byte
@@ -85,6 +86,7 @@ fn run_reciever() {
 
     let mut buffer = [0; 1500];
 
+    let mut expected_seq_num = 1;
 
     loop {
         let (size, source) = socket.recv_from(&mut buffer).expect("failed to recieve");
@@ -93,20 +95,34 @@ fn run_reciever() {
         }
         let header = Header::unpack(&buffer[0..7]);
 
-        if header.packet_type==2 {
-            println!("Recieved EOF packet from {}. File transfer complete", source);
-            break;
-        }
+        if header.packet_type == 0 {
+            if header.seq_num == expected_seq_num {
+                let payload_end = 7 + header.payload_len as usize;
+                if size >= payload_end {
+                    let payload_bytes = &buffer[7..payload_end];
+                    file.write_all(payload_bytes).expect("Failed to write to file");
+                    println!("Saved chunk {} ({} bytes", header.seq_num, header.payload_len);
 
-        let payload_start = 7;
-        let payload_end = 7 + header.payload_len as usize;
-        
-        if size<payload_end { continue; }
-        let payload_bytes = &buffer[payload_start..payload_end];
-        file.write_all(payload_bytes).expect("Failed to write to file");
-        
-        println!("Saved chunk {} ({} bytes", header.seq_num, header.payload_len);
-    
+                    expected_seq_num += 1;
+                }
+
+            }
+            let ack_header = Header {
+                packet_type:1,
+                seq_num: header.seq_num,
+                payload_len:0,
+            };
+            socket.send_to(&ack_header.pack(), source).expect("Failed to send ACK");
+        } else if header.packet_type == 2 {
+            println!("Recieved EOF packet. Transfer complete");
+            let ack_header = Header {
+                packet_type: 1,
+                seq_num: header.seq_num,
+                payload_len: 0,
+            };
+            socket.send_to(&ack_header.pack(), source).expect("Failed to send EOF ACK packet");
+            break;
+        } 
     }
 }
 
@@ -114,6 +130,8 @@ fn run_reciever() {
 fn run_sender(target: &str) {
     let socket = UdpSocket::bind("0.0.0.0:0").expect("Failed to bind");
 
+
+    socket.set_read_timeout(Some(Duration::from_millis(100))).expect("failed to set timeout");
 
     let mut file = File::open("test.txt").expect("Failed to open file..");
     let mut seq_num = 1;
@@ -123,19 +141,12 @@ fn run_sender(target: &str) {
 
     loop {
         let bytes_read = file.read(&mut chunk_buffer).expect("Failed to read file");
-
-        if bytes_read == 0{
-            println!("File read completely. Sending EOF packet...");
-            let eof_header = Header {
-                packet_type: 2,
-                seq_num,
-                payload_len: 0,
-            };
-            socket.send_to(&eof_header.pack(), target).expect("failed to send EOF");
-            break;
-        }
+        let is_eof = bytes_read==0;
+        
+        let packet_type = if is_eof {2} else {0};
+    
         let header = Header {
-            packet_type:0,
+            packet_type,
             seq_num,
             payload_len: bytes_read as u16,
         };
@@ -143,10 +154,36 @@ fn run_sender(target: &str) {
         packet.extend_from_slice(&header.pack());
         packet.extend_from_slice(&chunk_buffer[..bytes_read]); // only the bytes we read
 
-        socket.send_to(&packet, target).expect("Failed to send chunk..");
-        println!("Sent chunk {} ({} bytes", seq_num, bytes_read);
-        seq_num += 1;
-    }
+        // loop will keep sending this exact chunk until we get an ACk
+        loop {
+            socket.send_to(&packet, target).expect("Failed to send chunk..");
+            let mut ack_buffer = [0; 7];  // ACK is 7-byte header
+            match socket.recv_from(&mut ack_buffer) {
+                Ok((size, _)) => {
+                    if size >=7 {
+                        let ack_header = Header::unpack(&ack_buffer[0..7]);
 
-    println!("Trander conplete");
+                        // if it is not ACK ( type 1) AND it matches current sequence number
+                        if ack_header.packet_type == 1 && ack_header.seq_num==seq_num{
+                            println!("-> ACK recieved from chunk {} ", seq_num);
+                            break;
+                            // break out the inner loop to read next chunk
+                        }
+                    }
+                }
+                Err(_) => {
+                // executing if 100ms pass without ACk
+                // loop restarts
+                println!("Timeout! Resending chunk {}...", seq_num);
+                }
+            } 
+        }
+
+
+        if is_eof {
+            println!("Transfer complete and acknowledged!");
+            break;
+        }
+        seq_num +=1;
+    }
 }
