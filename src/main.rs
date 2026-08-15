@@ -2,8 +2,9 @@ use std::env;
 use std::net::UdpSocket;
 use std::process;
 use std::fs::File;
-use std::io::{ Read, Write};
+use std::io::{ Read, Write, BufReader, BufWriter};
 use std::time::Duration;
+
 
 struct Header {
     packet_type: u8,  // 1 byte
@@ -82,9 +83,10 @@ fn run_reciever() {
     let socket = UdpSocket::bind("0.0.0.0:8080").expect("Failed to bind");
     println!("Listning on port 8080");
 
-    let mut file = File::create("recieved_file.txt").expect("Failed to create file");
+    let file = File::create("recieved_file.txt").expect("Failed to create file");
+    let mut writer = BufWriter::new(file);
 
-    let mut buffer = [0; 1500];
+    let mut buffer = [0; 2048];
 
     let mut expected_seq_num = 1;
 
@@ -100,7 +102,7 @@ fn run_reciever() {
                 let payload_end = 7 + header.payload_len as usize;
                 if size >= payload_end {
                     let payload_bytes = &buffer[7..payload_end];
-                    file.write_all(payload_bytes).expect("Failed to write to file");
+                    writer.write_all(payload_bytes).expect("Failed to write to file");
                     println!("Saved chunk {} ({} bytes", header.seq_num, header.payload_len);
 
                     expected_seq_num += 1;
@@ -120,7 +122,9 @@ fn run_reciever() {
                 seq_num: header.seq_num,
                 payload_len: 0,
             };
+            
             socket.send_to(&ack_header.pack(), source).expect("Failed to send EOF ACK packet");
+            writer.flush().unwrap();
             break;
         } 
     }
@@ -133,14 +137,15 @@ fn run_sender(target: &str) {
 
     socket.set_read_timeout(Some(Duration::from_millis(100))).expect("failed to set timeout");
 
-    let mut file = File::open("test.txt").expect("Failed to open file..");
+    let file = File::open("test.txt").expect("Failed to open file..");
+    let mut reader = BufReader::new(file);
     let mut seq_num = 1;
-    let mut chunk_buffer = [0u8; 1000];
+    let mut chunk_buffer = [0u8; 1400];
 
     println!("Starting file transfer.....");
 
     loop {
-        let bytes_read = file.read(&mut chunk_buffer).expect("Failed to read file");
+        let bytes_read = reader.read(&mut chunk_buffer).expect("Failed to read file");
         let is_eof = bytes_read==0;
         
         let packet_type = if is_eof {2} else {0};
