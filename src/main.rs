@@ -1,9 +1,14 @@
 use std::env;
-use std::net::UdpSocket;
 use std::process;
-use std::fs::File;
-use std::io::{ Read, Write, BufReader, BufWriter};
+use std::sync::Arc;
 use std::time::Duration;
+
+use tokio::net::UdpSocket;
+use tokio::fs::File;
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::sync::mpsc;
+use tokio::time::timeout;
+
 
 
 struct Header {
@@ -47,7 +52,9 @@ impl Header {
 
 
 
-fn main() {
+#[tokio::main]
+async fn main() {
+
     let args: Vec<String> = env::args().collect();    
 
     if args.len()<2 {
@@ -60,7 +67,7 @@ fn main() {
     match mode.as_str() {
         "recieve" => {
             println!("Starting in reciever mode");
-            run_reciever();
+            run_reciever().await;
         }
         "send" => {
             if args.len()!=3 {
@@ -69,7 +76,7 @@ fn main() {
             }
             let target_ip = &args[2];
             println!("Starting in sending mode to {}", target_ip);
-            run_sender(target_ip);
+            run_sender(target_ip).await;
         }
         _ => {
             eprintln!("Unknown command. Use send or recieve");
@@ -79,19 +86,18 @@ fn main() {
 }
 
 
-fn run_reciever() {
-    let socket = UdpSocket::bind("0.0.0.0:8080").expect("Failed to bind");
-    println!("Listning on port 8080");
+async fn run_reciever() {
+    let socket = UdpSocket::bind("0.0.0.0:8080").await.expect("Failed to bind");
+    println!("Listning on port 8080....");
 
-    let file = File::create("recieved_file.txt").expect("Failed to create file");
+    let file = File::create("recieved_file.txt").await.expect("Failed to create file");
     let mut writer = BufWriter::new(file);
 
     let mut buffer = [0; 2048];
-
     let mut expected_seq_num = 1;
 
     loop {
-        let (size, source) = socket.recv_from(&mut buffer).expect("failed to recieve");
+        let (size, source) = socket.recv_from(&mut buffer).await.expect("failed to recieve");
         if size <7 {
             continue;
         }
@@ -102,8 +108,7 @@ fn run_reciever() {
                 let payload_end = 7 + header.payload_len as usize;
                 if size >= payload_end {
                     let payload_bytes = &buffer[7..payload_end];
-                    writer.write_all(payload_bytes).expect("Failed to write to file");
-                    println!("Saved chunk {} ({} bytes", header.seq_num, header.payload_len);
+                    writer.write_all(payload_bytes).await.expect("Failed to write to file");
 
                     expected_seq_num += 1;
                 }
@@ -114,7 +119,7 @@ fn run_reciever() {
                 seq_num: header.seq_num,
                 payload_len:0,
             };
-            socket.send_to(&ack_header.pack(), source).expect("Failed to send ACK");
+            socket.send_to(&ack_header.pack(), source).await.expect("Failed to send ACK");
         } else if header.packet_type == 2 {
             println!("Recieved EOF packet. Transfer complete");
             let ack_header = Header {
@@ -123,29 +128,65 @@ fn run_reciever() {
                 payload_len: 0,
             };
             
-            socket.send_to(&ack_header.pack(), source).expect("Failed to send EOF ACK packet");
-            writer.flush().unwrap();
+            socket.send_to(&ack_header.pack(), source).await.expect("Failed to send EOF ACK packet");
+            writer.flush().await.expect("Flush failed");
             break;
         } 
     }
 }
 
 
-fn run_sender(target: &str) {
-    let socket = UdpSocket::bind("0.0.0.0:0").expect("Failed to bind");
+async fn run_sender(target: &str) {
+    let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await.expect("Failed to bind"));
+    let listener_socket = socket.clone();
 
+    // channel to hold 100 ACKs in tube at once
+    let (tx, mut rx) = mpsc::channel::<u32>(100);
 
-    socket.set_read_timeout(Some(Duration::from_millis(100))).expect("failed to set timeout");
+    tokio::spawn(async move {
 
-    let file = File::open("test.txt").expect("Failed to open file..");
+        let mut ack_buffer = [0u8; 7];
+        loop {
+            if let Ok((size, _)) = listener_socket.recv_from(&mut ack_buffer).await {
+                if size >=7 {
+                    let header = Header::unpack(&ack_buffer[0..7]);
+                    if header.packet_type == 1 { // ACk
+                        // push acknowledged sequence number into tube
+                        let _ = tx.send(header.seq_num).await;
+                    }
+                }
+            }
+        }
+    });
+
+    let file = File::open("test.txt").await.expect("Failed to open file..");
     let mut reader = BufReader::new(file);
+
     let mut seq_num = 1;
+    let mut last_acked = 0;
+    let window_size = 50;
+
     let mut chunk_buffer = [0u8; 1400];
 
     println!("Starting file transfer.....");
 
     loop {
-        let bytes_read = reader.read(&mut chunk_buffer).expect("Failed to read file");
+
+        //PIPELINE CHECK
+        while seq_num - last_acked > window_size {
+            match timeout(Duration::from_millis(100), rx.recv()).await {
+                Ok(Some(acked_num)) => {
+                    if acked_num > last_acked { last_acked = acked_num; }
+                }
+                _ => {
+                    // Timeout! window is clocked
+                    println!("Network clogged! Waiting for ACKs...");
+                }
+            }
+        }
+
+        
+        let bytes_read = reader.read(&mut chunk_buffer).await.expect("Failed to read file");
         let is_eof = bytes_read==0;
         
         let packet_type = if is_eof {2} else {0};
@@ -159,36 +200,17 @@ fn run_sender(target: &str) {
         packet.extend_from_slice(&header.pack());
         packet.extend_from_slice(&chunk_buffer[..bytes_read]); // only the bytes we read
 
-        // loop will keep sending this exact chunk until we get an ACk
-        loop {
-            socket.send_to(&packet, target).expect("Failed to send chunk..");
-            let mut ack_buffer = [0; 7];  // ACK is 7-byte header
-            match socket.recv_from(&mut ack_buffer) {
-                Ok((size, _)) => {
-                    if size >=7 {
-                        let ack_header = Header::unpack(&ack_buffer[0..7]);
-
-                        // if it is not ACK ( type 1) AND it matches current sequence number
-                        if ack_header.packet_type == 1 && ack_header.seq_num==seq_num{
-                            println!("-> ACK recieved from chunk {} ", seq_num);
-                            break;
-                            // break out the inner loop to read next chunk
-                        }
-                    }
-                }
-                Err(_) => {
-                // executing if 100ms pass without ACk
-                // loop restarts
-                println!("Timeout! Resending chunk {}...", seq_num);
-                }
-            } 
-        }
-
+        
+        socket.send_to(&packet, target).await.expect("Send failed..");
 
         if is_eof {
             println!("Transfer complete and acknowledged!");
             break;
         }
         seq_num +=1;
+
+        while let Ok(acked_num) = rx.try_recv() {
+            if acked_num > last_acked { last_acked = acked_num; }
+        }
     }
 }
