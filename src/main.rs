@@ -9,6 +9,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
+use chacha20poly1305::{
+    aead::{Aead, KeyInit},
+    ChaCha20Poly1305, Key, Nonce
+};
 
 
 struct Header {
@@ -50,6 +54,33 @@ impl Header {
     }
 }
 
+const SHARED_SECRET: &[u8; 32] = b"SECRET_KEY_MUST_BE_32_BYTES_LONG";
+
+// padding 40byte seqence number into 12-byte Nonce
+fn seq_to_nonce(seq_num: u32) -> Nonce {
+    let mut nonce_bytes = [0u8; 12];
+    nonce_bytes[8] = (seq_num >> 24) as u8;
+    nonce_bytes[9] = (seq_num >> 16) as u8;
+    nonce_bytes[10] = (seq_num >> 8) as u8;
+    nonce_bytes[11] = seq_num as u8;
+
+    Nonce::from(nonce_bytes)
+}
+
+fn encrypt_chunk(seq_num: u32, plaintext: &[u8]) -> Vec<u8> {
+    let key = Key::from(*SHARED_SECRET);
+    let cipher = ChaCha20Poly1305::new(&key);
+    let nonce = seq_to_nonce(seq_num);
+    cipher.encrypt(&nonce, plaintext).expect("Encryption Failed..")
+}
+
+fn decrypt_chunk(seq_num: u32, ciphertext: &[u8]) -> Result<Vec<u8>, chacha20poly1305::aead::Error> {
+    let key = Key::from(*SHARED_SECRET);
+    
+    let cipher = ChaCha20Poly1305::new(&key);
+    let nonce = seq_to_nonce(seq_num);
+    cipher.decrypt(&nonce, ciphertext)
+}
 
 
 #[tokio::main]
@@ -103,14 +134,25 @@ async fn run_reciever() {
         }
         let header = Header::unpack(&buffer[0..7]);
 
-        if header.packet_type == 0 {
+        if header.packet_type == 0 { // DATA
             if header.seq_num == expected_seq_num {
                 let payload_end = 7 + header.payload_len as usize;
                 if size >= payload_end {
-                    let payload_bytes = &buffer[7..payload_end];
-                    writer.write_all(payload_bytes).await.expect("Failed to write to file");
+                    let encrypted_payload = &buffer[7..payload_end];
 
-                    expected_seq_num += 1;
+                    match decrypt_chunk(header.seq_num, encrypted_payload) {
+                        Ok(decrypted_bytes) => {
+
+                            writer.write_all(&decrypted_bytes).await.expect("Failed to write to file");
+                            expected_seq_num += 1;
+                        }
+                        Err(_) => {
+                            eprintln!("WARNING: chunk {} failed crytographic authentication! Droping packet..", header.seq_num);
+
+                        }
+                    }
+
+                    
                 }
 
             }
@@ -188,17 +230,21 @@ async fn run_sender(target: &str) {
         
         let bytes_read = reader.read(&mut chunk_buffer).await.expect("Failed to read file");
         let is_eof = bytes_read==0;
+
+        let plaintext = &chunk_buffer[..bytes_read];
+        let encrypted_payload = encrypt_chunk(seq_num, plaintext);
+
         
         let packet_type = if is_eof {2} else {0};
     
         let header = Header {
             packet_type,
             seq_num,
-            payload_len: bytes_read as u16,
+            payload_len: encrypted_payload.len() as u16,
         };
         let mut packet = Vec::new();
         packet.extend_from_slice(&header.pack());
-        packet.extend_from_slice(&chunk_buffer[..bytes_read]); // only the bytes we read
+        packet.extend_from_slice(&encrypted_payload); // only the bytes we read
 
         
         socket.send_to(&packet, target).await.expect("Send failed..");
