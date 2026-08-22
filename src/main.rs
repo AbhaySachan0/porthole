@@ -4,6 +4,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::io::{self, Write};
 
+use clap::{Parser, Subcommand};
+
 use tokio::net::UdpSocket;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
@@ -25,6 +27,27 @@ struct Header {
     seq_num: u32,     // 4 bytes
     payload_len: u16, // 2 bytes
 }
+
+#[derive(Parser)]
+#[command(name = "Porthole")]
+#[command(about = "A secure, fast P2P file transfer tool", long_about = None)]
+
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+#[derive(Subcommand)]
+enum Commands {
+    Recieve {
+        file: String,
+    },
+    Send {
+        file:String,
+        target: String,
+    },
+
+}
+
 
 fn generate_magic_code() -> String {
     let adjectives = [
@@ -116,32 +139,23 @@ async fn main() {
         eprintln!("{} [recieve | send <ip:port>", args[0]);
         process::exit(1);
     }
+     
+    let cli = Cli::parse();
 
-    let mode = &args[1];
-
-    match mode.as_str() {
-        "recieve" => {
-            println!("Starting in reciever mode");
-            run_reciever().await;
+    match &cli.command {
+        Commands::Recieve {file} => {
+            println!("Starting porthole in Reciever mode...");
+            run_reciever(&file).await;
         }
-        "send" => {
-            if args.len()!=3 {
-                eprintln!("Usage for sending: {} send <ip:port>", args[0]);
-                process::exit(1);
-            }
-            let target_ip = &args[2];
-            println!("Starting in sending mode to {}", target_ip);
-            run_sender(target_ip).await;
-        }
-        _ => {
-            eprintln!("Unknown command. Use send or recieve");
-            process::exit(1);
+        Commands::Send { file, target } => {
+            println!("Starting porthole in sender mode to {}...", target);
+            run_sender(&file, &target).await;
         }
     }
 }
 
 
-async fn run_reciever() {
+async fn run_reciever(save_path: &str) {
     let socket = UdpSocket::bind("0.0.0.0:8080").await.expect("Failed to bind");
     println!("Listning on port 8080....");
 
@@ -215,59 +229,8 @@ async fn run_reciever() {
         }
     }
 
-   //  while attempts > 0 {
-   //      print!("Enter code : ");
-   //      io::stdout().flush().unwrap();
-   //
-   //      let mut input = String::new();
-   //      io::stdin().read_line(&mut input).expect("failed to read line");
-   //      let code = input.trim();
-   //
-   //      let pw = Password::new(code.as_bytes());
-   //
-   //      let (state, my_msg_b) = Spake2::<Ed25519Group>::start_b(&pw, &id_a, &id_b);
-   //
-   //      match state.finish(&msg_a) {
-   //          Ok(final_key_vec) => {
-   //
-   //              derived_key.copy_from_slice(&final_key_vec);
-   //              final_msg_b = my_msg_b;
-   //              success = true;
-   //              break;
-   //          }
-   //          Err(_) => {
-   //              attempts -= 1;
-   //              if attempts > 0 {
-   //                  println!("{} attempts left", attempts);
-   //              } else {
-   //                  println!("authentication failed..no attempts left");
-   //              }
-   //          }
-   //      }
-   //
-   //  }
-   // if !success {
-   //      let header_abort = Header { packet_type:5, seq_num: 0, payload_len: 0};
-   //      for _ in 0..5 {
-   //          let _ = socket.send_to(&header_abort.pack(), source).await;
-   //          process::exit(1);
-   //      }
-   // }
-   //
-   // let header_b = Header { packet_type: 4, seq_num: 0, payload_len: final_msg_b.len() as u16};
-   // let mut packet_b = Vec::new();
-   // packet_b.extend_from_slice(&header_b.pack());
-   // packet_b.extend_from_slice(&final_msg_b);
-   //
-   // for _ in 0..5 {
-   //     socket.send_to(&packet_b, source).await.expect("Failed to send message B");
-   // }
-   // println!("Handshake successfull! 32-byte key securely generated");
-   //
-   //
-    // HANDSHAKE END
    
-    let file = File::create("recieved_file.txt").await.expect("Failed to create file");
+    let file = File::create(save_path).await.expect("Failed to create file");
     let mut writer = BufWriter::new(file);
 
     let mut buffer = [0; 2048];
@@ -334,7 +297,7 @@ async fn run_reciever() {
 }
 
 
-async fn run_sender(target: &str) {
+async fn run_sender(file_path: &str, target: &str) {
     let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await.expect("Failed to bind"));
     let listener_socket = socket.clone();
 
@@ -432,7 +395,7 @@ async fn run_sender(target: &str) {
         }
     });
 
-    let file = File::open("test.txt").await.expect("Failed to open file..");
+    let file = File::open(file_path).await.expect("Failed to open file..");
     let mut reader = BufReader::new(file);
 
     let mut seq_num = 1;
