@@ -13,6 +13,7 @@ use spake2::{Spake2, Ed25519Group, Password, Identity};
 use crate::protocol::Header;
 use crate::crypto:: {generate_magic_code, encrypt_chunk};
 
+use indicatif::{ProgressBar, ProgressStyle};
 
 pub async fn run_sender(file_path: &str, target: &str) {
     let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await.expect("Failed to bind"));
@@ -113,6 +114,16 @@ pub async fn run_sender(file_path: &str, target: &str) {
     });
 
     let file = File::open(file_path).await.expect("Failed to open file..");
+
+    let file_size = file.metadata().await.expect("Failed to read metadata").len();
+
+    let pb = ProgressBar::new(file_size);
+    pb.set_style(ProgressStyle::default_bar()
+        .template("{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})")
+            .unwrap()
+            .progress_chars("#>-")
+        );
+
     let mut reader = BufReader::new(file);
 
     let mut seq_num = 1;
@@ -142,6 +153,10 @@ pub async fn run_sender(file_path: &str, target: &str) {
         let bytes_read = reader.read(&mut chunk_buffer).await.expect("Failed to read file");
         let is_eof = bytes_read==0;
 
+        if bytes_read > 0 {
+            pb.inc(bytes_read as u64);
+        }
+
         let plaintext = &chunk_buffer[..bytes_read];
         let encrypted_payload = encrypt_chunk(seq_num, plaintext, &derived_key);
 
@@ -161,7 +176,7 @@ pub async fn run_sender(file_path: &str, target: &str) {
         socket.send_to(&packet, target).await.expect("Send failed..");
 
         if is_eof {
-            println!("Transfer complete and acknowledged!");
+            pb.finish_with_message(format!("Transfer complete ! Send {}", file_path));
             break;
         }
         seq_num +=1;

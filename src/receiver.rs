@@ -11,6 +11,8 @@ use spake2::{Spake2, Ed25519Group, Password, Identity};
 use crate::protocol::Header;
 use crate::crypto::decrypt_chunk;
 
+use indicatif::{ProgressBar, ProgressStyle};
+
 pub async fn run_receiver(save_path: &str) {
     let socket = UdpSocket::bind("0.0.0.0:8080").await.expect("Failed to bind");
     println!("Listning on port 8080....");
@@ -89,6 +91,15 @@ pub async fn run_receiver(save_path: &str) {
     let file = File::create(save_path).await.expect("Failed to create file");
     let mut writer = BufWriter::new(file);
 
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner:.green} [{elapsed_precise}] Receiving... {bytes} saved ({bytes_per_sec})")
+            .unwrap()
+    );
+    pb.enable_steady_tick(Duration::from_millis(100));
+
+    
     let mut buffer = [0; 2048];
     let mut expected_seq_num = 1;
 
@@ -110,6 +121,8 @@ pub async fn run_receiver(save_path: &str) {
 
                             writer.write_all(&decrypted_bytes).await.expect("Failed to write to file");
                             expected_seq_num += 1;
+
+                            pb.inc(decrypted_bytes.len() as u64);
                             let ack_header = Header {
                                 packet_type: 1,
                                 seq_num: header.seq_num,
@@ -129,6 +142,7 @@ pub async fn run_receiver(save_path: &str) {
 
             }
             else if header.seq_num < expected_seq_num {
+                pb.finish_with_message("transfer complete ...File saved successfully");
                 let ack_header = Header {
                     packet_type:1,
                     seq_num: header.seq_num,
