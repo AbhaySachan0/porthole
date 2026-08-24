@@ -5,7 +5,8 @@ use std::process;
 
 use tokio::net::UdpSocket;
 use tokio::fs::File;
-use tokio::io::{AsyncReadExt, BufReader};
+use std::io::SeekFrom;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, BufReader};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 use spake2::{Spake2, Ed25519Group, Password, Identity};
@@ -14,6 +15,7 @@ use crate::protocol::Header;
 use crate::crypto:: {generate_magic_code, encrypt_chunk};
 
 use indicatif::{ProgressBar, ProgressStyle};
+
 
 pub async fn run_sender(file_path: &str, target: &str) {
     let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await.expect("Failed to bind"));
@@ -124,12 +126,13 @@ pub async fn run_sender(file_path: &str, target: &str) {
             .progress_chars("#>-")
         );
 
-    let mut reader = BufReader::new(file);
+    let mut reader = BufReader::with_capacity(1024*1024*8, file);
 
     let mut seq_num = 1;
     let mut last_acked = 0;
-    let window_size = 50;
+    let window_size = 100;
 
+    let mut dup_ack_count = 0;   // duplicate ACK counts
     let mut chunk_buffer = [0u8; 1400];
 
     println!("Starting file transfer.....");
@@ -140,11 +143,17 @@ pub async fn run_sender(file_path: &str, target: &str) {
         while seq_num - last_acked > window_size {
             match timeout(Duration::from_millis(100), rx.recv()).await {
                 Ok(Some(acked_num)) => {
-                    if acked_num > last_acked { last_acked = acked_num; }
+                    if acked_num > last_acked { 
+                        last_acked = acked_num; 
+                        dup_ack_count = 0;
+                    }
                 }
                 _ => {
-                    // Timeout! window is clocked
-                    println!("Network clogged! Waiting for ACKs...");
+                    seq_num = last_acked +1;
+                    let rewind_offset = (last_acked as u64) * 1400;
+
+                    reader.seek(SeekFrom::Start(rewind_offset)).await.expect("Failed to rewind file");
+                    break;
                 }
             }
         }
@@ -154,7 +163,7 @@ pub async fn run_sender(file_path: &str, target: &str) {
         let is_eof = bytes_read==0;
 
         if bytes_read > 0 {
-            pb.inc(bytes_read as u64);
+            pb.set_position(((seq_num-1) as u64) * 1400 + bytes_read as u64);
         }
 
         let plaintext = &chunk_buffer[..bytes_read];
@@ -182,7 +191,20 @@ pub async fn run_sender(file_path: &str, target: &str) {
         seq_num +=1;
 
         while let Ok(acked_num) = rx.try_recv() {
-            if acked_num > last_acked { last_acked = acked_num; }
+            if acked_num > last_acked { 
+                last_acked = acked_num; 
+                dup_ack_count = 0;
+            } else if acked_num ==  last_acked {
+                dup_ack_count += 1;
+                if dup_ack_count >= 3 {
+                    seq_num = last_acked +1;
+                    let rewind_offset = (last_acked as u64) * 1400;
+                    reader.seek(SeekFrom::Start(rewind_offset)).await.expect("Failed to rewind file..");
+                    dup_ack_count = 0;
+                    break;
+                }
+
+            }
         }
     }
 }
