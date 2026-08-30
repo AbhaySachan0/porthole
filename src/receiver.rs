@@ -1,6 +1,7 @@
 use std::io::{self, Write};
 use std::process;
 use std::time::Duration;
+use std::path::PathBuf;
 
 use tokio::net::UdpSocket;
 use tokio::fs::File;
@@ -57,6 +58,10 @@ pub async fn run_receiver(save_path: &str) {
     for _ in 0..5 { socket.send_to(&packet_b, source).await.unwrap(); }
     println!("Waiting for sender to confirm password");
     
+    // variable to hold dynamically generated path
+    let mut actual_save_path = PathBuf::new();
+    
+    // Key Confirmation
     loop {
         match timeout(Duration::from_millis(500), socket.recv_from(&mut handshake_buffer)).await {
             Ok(Ok((size, _))) => {
@@ -65,7 +70,10 @@ pub async fn run_receiver(save_path: &str) {
                     if header.packet_type == 5 {
                         let ciphertext = &handshake_buffer[7..size];
                         match decrypt_chunk(0, ciphertext, &derived_key) {
-                            Ok(plaintext) if plaintext == b"AUTH" => {
+                            Ok(plaintext) if plaintext.starts_with(b"AUTH") => {
+                                let file_name = String::from_utf8_lossy(&plaintext[5..]).to_string();
+                                actual_save_path = std::path::Path::new(save_path).join(&file_name);
+                                
                                 // PASSWORDS MATCH! Send Type 6 (ACK)
                                 let ack = Header { packet_type: 6, seq_num: 0, payload_len: 0 };
                                 for _ in 0..5 { socket.send_to(&ack.pack(), source).await.unwrap(); }
@@ -88,8 +96,8 @@ pub async fn run_receiver(save_path: &str) {
     }
 
    
-    let file = File::create(save_path).await.expect("Failed to create file");
-    let mut writer = BufWriter::new(file);
+    let file = File::create(&actual_save_path).await.expect("Failed to create file");
+    let mut writer = BufWriter::with_capacity(1024*1024*8, file);
 
     let pb = ProgressBar::new_spinner();
     pb.set_style(

@@ -20,7 +20,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     Receive {
-        file: String,
+       dir: String,
     },
     Send {
         file:String,
@@ -36,9 +36,9 @@ async fn main() {
     let cli = Cli::parse();
 
     match &cli.command {
-        Commands::Receive {file} => {
+        Commands::Receive {dir} => {
             println!("Starting porthole in Receiver mode...");
-            run_receiver(&file).await;
+            run_receiver(dir).await;
         }
         Commands::Send { file, target } => {
             println!("Starting porthole in sender mode to {}...", target);

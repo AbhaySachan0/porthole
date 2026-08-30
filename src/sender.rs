@@ -2,6 +2,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 use std::process;
+use std::path::Path;
 
 use tokio::net::UdpSocket;
 use tokio::fs::File;
@@ -68,7 +69,13 @@ pub async fn run_sender(file_path: &str, target: &str) {
     }
     println!("Verifying password with receiver...");
 
-    let auth_ciphertext = encrypt_chunk(0, b"AUTH", &derived_key);
+    let file_name = Path::new(file_path).file_name().unwrap().to_str().unwrap();
+
+    let mut auth_message = b"AUTH:".to_vec();
+    auth_message.extend_from_slice(file_name.as_bytes());
+
+
+    let auth_ciphertext = encrypt_chunk(0, &auth_message, &derived_key);
     let auth_header = Header { packet_type:5, seq_num: 0, payload_len: auth_ciphertext.len() as u16};
     let mut auth_packet = Vec::new();
     auth_packet.extend_from_slice(&auth_header.pack());
