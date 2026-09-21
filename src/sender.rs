@@ -137,7 +137,10 @@ pub async fn run_sender(file_path: &str, target: &str) {
 
     let mut seq_num = 1;
     let mut last_acked = 0;
-    let window_size = 100;
+    let mut window_size = 100;
+    const MIN_WINDOW: u32 = 10;
+    const MAX_WINDOW: u32 = 5000;
+
 
     let mut dup_ack_count = 0;   // duplicate ACK counts
     let mut chunk_buffer = [0u8; 1400];
@@ -153,9 +156,12 @@ pub async fn run_sender(file_path: &str, target: &str) {
                     if acked_num > last_acked { 
                         last_acked = acked_num; 
                         dup_ack_count = 0;
+
+                        window_size = (window_size +1).min(MAX_WINDOW);
                     }
                 }
                 _ => {
+                    window_size = (window_size/2).max(MIN_WINDOW);
                     seq_num = last_acked +1;
                     let rewind_offset = (last_acked as u64) * 1400;
 
